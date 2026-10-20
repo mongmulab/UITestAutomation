@@ -20,6 +20,9 @@ Add-Type @"
 using System; using System.Runtime.InteropServices;
 public static class ClickCheck {
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindow(string c, string t);
+  [DllImport("user32.dll")] public static extern bool GetPhysicalCursorPos(out P p);
+  [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref P p);
+  public struct P { public int X, Y; }
 }
 "@
 
@@ -49,6 +52,11 @@ try {
     Write-Output ("expected: " + ($expected -join "  "))
     Write-Output ("received: " + ($got -join "  "))
     if (($got -join "|") -eq ($expected -join "|")) { Write-Output "PASS"; exit 0 }
+    $status = $win.FindFirst($T::Descendants, (New-Object System.Windows.Automation.PropertyCondition($A::AutomationIdProperty, "TxtStatus")))
+    if ($status) { Write-Output ("app status: " + $status.Current.Name) }
+    $c = New-Object ClickCheck+P; [ClickCheck]::GetPhysicalCursorPos([ref]$c) | Out-Null
+    $o = New-Object ClickCheck+P; [ClickCheck]::ClientToScreen($h, [ref]$o) | Out-Null
+    Write-Output ("cursor {0},{1}  target client origin {2},{3}  target alive {4}" -f $c.X, $c.Y, $o.X, $o.Y, (-not $tp.HasExited))
     Write-Output "FAIL"; exit 1
 }
 finally {

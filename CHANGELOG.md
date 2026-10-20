@@ -30,6 +30,7 @@
 
 ### Changed
 
+- New window layout: target window in the header, card-style controls, event list with key names and type badges, status bar with the stop hotkey. The event list and JSON editor grow with the window.
 - .NET 7 (end of support May 2024) to .NET 8.
 - DPI awareness is declared in `app.manifest`. Setting it from code after WPF starts had no effect.
 - Coordinate, file-format and timing logic moved to `UITestAutomation.Core` with unit tests.
