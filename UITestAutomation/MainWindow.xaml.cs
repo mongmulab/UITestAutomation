@@ -104,14 +104,16 @@ namespace UITestAutomation
                 LblOffY.Text = _calib.OffsetY.ToString();
                 LblCW.Text = _calib.ContentW.ToString();
                 LblCH.Text = _calib.ContentH.ToString();
-                LblCalibHint.Text = "Calibration: Active";
+                LblCalibHint.Text = "Calibration is active.";
             }
             else
             {
                 LblOffX.Text = LblOffY.Text = LblCW.Text = LblCH.Text = "-";
-                LblCalibHint.Text = "Click Start Calibration, then click CONTENT Top-Left and Bottom-Right of target window.";
+                LblCalibHint.Text = "Click Start, then click the top-left and bottom-right corners of the phone screen.";
             }
         }
+
+        private sealed record EventRow(int No, string Kind, string Detail, string Delay);
 
         private void RefreshListAndJson()
         {
@@ -119,16 +121,18 @@ namespace UITestAutomation
             for (int i = 0; i < _events.Count; i++)
             {
                 var ev = _events[i];
-                string ext = ev.Extended ? " ext" : "";
-                string line = ev.Type switch
+                string ext = ev.Extended ? "  ext" : "";
+                var row = ev.Type switch
                 {
-                    EventType.MouseClick => $"{i + 1}: MOUSE ({ev.X},{ev.Y}), delay={ev.DelayMs}ms",
-                    EventType.KeyDown => $"{i + 1}: KEYDOWN VK={ev.VkCode} scan={ev.ScanCode}{ext}, delay={ev.DelayMs}ms",
-                    EventType.KeyUp => $"{i + 1}: KEYUP   VK={ev.VkCode} scan={ev.ScanCode}{ext}, delay={ev.DelayMs}ms",
-                    _ => $"{i + 1}: ?"
+                    EventType.MouseClick => new EventRow(i + 1, "CLICK", $"({ev.X}, {ev.Y})", $"{ev.DelayMs} ms"),
+                    EventType.KeyDown => new EventRow(i + 1, "KEY DOWN", $"VK {ev.VkCode}  scan {ev.ScanCode}{ext}", $"{ev.DelayMs} ms"),
+                    EventType.KeyUp => new EventRow(i + 1, "KEY UP", $"VK {ev.VkCode}  scan {ev.ScanCode}{ext}", $"{ev.DelayMs} ms"),
+                    _ => new EventRow(i + 1, "?", "", "")
                 };
-                ListEvents.Items.Add(line);
+                ListEvents.Items.Add(row);
             }
+            TxtCount.Text = _events.Count.ToString();
+            TxtTarget.Text = _targetTitle.Length > 0 ? $"Target: {_targetTitle}" : "Target: screen";
 
             // JSON 미리보기: 캘리브 유효하면 객체형식, 아니면 레거시 배열
             TxtJson.Text = MacroSerializer.Serialize(_events, _calib, _targetTitle);
@@ -256,7 +260,7 @@ namespace UITestAutomation
             _calibActive = true;
             _calibPtTL = null;
             _calibPtBR = null;
-            LblCalibHint.Text = "Calibration: Click CONTENT Top-Left, then Bottom-Right (2 clicks).";
+            LblCalibHint.Text = "Now click the top-left corner, then the bottom-right corner.";
             SetStatus("Calibration waiting for 2 clicks...");
             // 녹화 전후 어느 때나 보정할 수 있게 마우스 훅만 잠시 건다. 두 번 누르면 다시 푼다.
             if (_mouseHookId == IntPtr.Zero) _mouseHookId = NativeMethods.SetMouseHook(_mouseProc);
