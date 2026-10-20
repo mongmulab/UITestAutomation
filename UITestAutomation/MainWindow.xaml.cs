@@ -4,67 +4,42 @@ using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
-using System.Text.Json;
-using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Input;
+using System.Windows.Interop;
 using System.Windows.Threading;
+using UITestAutomation.Core;
+using CorePoint = UITestAutomation.Core.Point;
 
-namespace MouseMacroWpf
+namespace UITestAutomation
 {
     public partial class MainWindow : Window
     {
-        // ===== Models =========================================================
-        public enum EventType { MouseClick, KeyDown, KeyUp }
-
-        public class InputEvent
-        {
-            public EventType Type { get; set; } = EventType.MouseClick;
-            // Mouse
-            public int X { get; set; }
-            public int Y { get; set; }
-            public int Button { get; set; } = 0; // 0=Left
-            // Keyboard
-            public int VkCode { get; set; }
-            public int ScanCode { get; set; }
-            // Common
-            public int DelayMs { get; set; } = 1000;
-        }
-
-        public class Calibration
-        {
-            public int OffsetX { get; set; }
-            public int OffsetY { get; set; }
-            public int ContentW { get; set; }
-            public int ContentH { get; set; }
-
-            [JsonIgnore]
-            public bool IsValid => ContentW > 0 && ContentH > 0;
-        }
-
-        // 새 JSON 루트(캘리브+이벤트). 과거 배열(JSON List)과 호환됨.
-        public class MacroFile
-        {
-            public Calibration? Calibration { get; set; }
-            public List<InputEvent> Events { get; set; } = new();
-        }
-
         private List<InputEvent> _events = new();
         private Calibration _calib = new(); // 기본 0 / invalid
 
         // ===== Recording state ===============================================
         private IntPtr _mouseHookId = IntPtr.Zero;
         private IntPtr _kbdHookId = IntPtr.Zero;
-        private LowLevelMouseProc _mouseProc;
-        private LowLevelKeyboardProc _kbdProc;
+        private readonly LowLevelMouseProc _mouseProc;
+        private readonly LowLevelKeyboardProc _kbdProc;
         private IntPtr _targetWindow = IntPtr.Zero;
+        private string _targetTitle = "";
+        private IntPtr _ownWindow = IntPtr.Zero;
+        private bool _recording = false;
+        private RecordingClock _clock = new();
+
+        // 훅 콜백에서 목록을 매번 다시 그리면 콜백이 늦어져 Windows 가 훅을 끊을 수 있다.
+        // 콜백은 표시만 해 두고, 화면 갱신은 타이머가 몰아서 한다.
+        private bool _listDirty = false;
+        private readonly DispatcherTimer _refreshTimer = new() { Interval = TimeSpan.FromMilliseconds(150) };
 
         // ===== Calibration state ==============================================
         private bool _calibActive = false;
-        private POINT? _calibPtTL = null; // client coords
-        private POINT? _calibPtBR = null; // client coords
+        private CorePoint? _calibPtTL = null; // client coords
+        private CorePoint? _calibPtBR = null; // client coords
 
         // ===== Playback state ================================================
         private CancellationTokenSource? _playbackCts;
@@ -76,12 +51,41 @@ namespace MouseMacroWpf
             InitializeComponent();
             _mouseProc = MouseHookCallback;
             _kbdProc = KeyboardHookCallback;
+            _refreshTimer.Tick += (s, e) =>
+            {
+                if (!_listDirty) return;
+                _listDirty = false;
+                RefreshListAndJson();
+            };
             UpdateUiState();
             UpdateCalibLabels();
+
+            // UITestAutomation.exe macro.json 로 실행하면 그 파일을 열어 둔다.
+            var args = Environment.GetCommandLineArgs();
+            if (args.Length > 1 && File.Exists(args[1])) LoadMacroFile(args[1]);
+        }
+
+        protected override void OnSourceInitialized(EventArgs e)
+        {
+            base.OnSourceInitialized(e);
+            _ownWindow = new WindowInteropHelper(this).Handle;
+            // 핫키 메시지 훅은 한 번만 건다. 재생할 때마다 걸면 같은 처리기가 겹겹이 쌓인다.
+            HwndSource.FromHwnd(_ownWindow)?.AddHook(HwndHook);
+        }
+
+        protected override void OnClosed(EventArgs e)
+        {
+            _playbackCts?.Cancel();
+            UnhookMouse();
+            UnhookKeyboard();
+            UnregisterStopHotkey();
+            base.OnClosed(e);
         }
 
         // ===== UI helpers =====================================================
         private void UI(Action a) => Dispatcher.Invoke(a);
+
+        private void SetStatus(string text) => UI(() => TxtStatus.Text = text);
 
         private void UpdateUiState()
         {
@@ -94,7 +98,7 @@ namespace MouseMacroWpf
 
         private void UpdateCalibLabels()
         {
-            if (_calib != null && _calib.IsValid)
+            if (_calib.IsValid)
             {
                 LblOffX.Text = _calib.OffsetX.ToString();
                 LblOffY.Text = _calib.OffsetY.ToString();
@@ -115,60 +119,41 @@ namespace MouseMacroWpf
             for (int i = 0; i < _events.Count; i++)
             {
                 var ev = _events[i];
+                string ext = ev.Extended ? " ext" : "";
                 string line = ev.Type switch
                 {
                     EventType.MouseClick => $"{i + 1}: MOUSE ({ev.X},{ev.Y}), delay={ev.DelayMs}ms",
-                    EventType.KeyDown => $"{i + 1}: KEYDOWN VK={ev.VkCode} scan={ev.ScanCode}, delay={ev.DelayMs}ms",
-                    EventType.KeyUp => $"{i + 1}: KEYUP   VK={ev.VkCode} scan={ev.ScanCode}, delay={ev.DelayMs}ms",
+                    EventType.KeyDown => $"{i + 1}: KEYDOWN VK={ev.VkCode} scan={ev.ScanCode}{ext}, delay={ev.DelayMs}ms",
+                    EventType.KeyUp => $"{i + 1}: KEYUP   VK={ev.VkCode} scan={ev.ScanCode}{ext}, delay={ev.DelayMs}ms",
                     _ => $"{i + 1}: ?"
                 };
                 ListEvents.Items.Add(line);
             }
 
             // JSON 미리보기: 캘리브 유효하면 객체형식, 아니면 레거시 배열
-            if (_calib != null && _calib.IsValid)
-            {
-                var mf = new MacroFile { Calibration = _calib, Events = _events };
-                TxtJson.Text = JsonSerializer.Serialize(mf, new JsonSerializerOptions { WriteIndented = true });
-            }
-            else
-            {
-                TxtJson.Text = JsonSerializer.Serialize(_events, new JsonSerializerOptions { WriteIndented = true });
-            }
+            TxtJson.Text = MacroSerializer.Serialize(_events, _calib, _targetTitle);
         }
 
-        private void TryLoadEventsFromJsonText()
+        // 재생 직전에 편집한 JSON 을 반영한다. 고친 JSON 이 깨져 있으면 재생하지 않는다.
+        private bool TryLoadEventsFromJsonText()
         {
+            var text = TxtJson.Text?.Trim();
+            if (string.IsNullOrWhiteSpace(text)) return true;
             try
             {
-                var text = TxtJson.Text?.Trim();
-                if (string.IsNullOrWhiteSpace(text)) return;
-
-                if (text.StartsWith("{"))
-                {
-                    var mf = JsonSerializer.Deserialize<MacroFile>(text);
-                    if (mf != null)
-                    {
-                        _events = mf.Events ?? new();
-                        _calib = mf.Calibration ?? new();
-                        UpdateCalibLabels();
-                        RefreshListAndJson();
-                    }
-                }
-                else if (text.StartsWith("["))
-                {
-                    var parsed = JsonSerializer.Deserialize<List<InputEvent>>(text);
-                    if (parsed != null)
-                    {
-                        _events = parsed;
-                        // 캘리브는 유지
-                        RefreshListAndJson();
-                    }
-                }
+                var (events, calib, title) = MacroSerializer.Parse(text);
+                _events = events;
+                if (calib != null) _calib = calib; // 배열 형식이면 캘리브는 유지
+                if (title != null) SetTarget(title);
+                UpdateCalibLabels();
+                RefreshListAndJson();
+                return true;
             }
-            catch
+            catch (Exception ex)
             {
-                // 편집 중 오류 무시
+                MessageBox.Show("The JSON in the editor is not valid, so playback did not start.\n\n" + ex.Message,
+                    "JSON error", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return false;
             }
         }
 
@@ -176,19 +161,28 @@ namespace MouseMacroWpf
         private void BtnRecord_Click(object sender, RoutedEventArgs e)
         {
             var title = Microsoft.VisualBasic.Interaction.InputBox(
-                "window title to be titled (partial strings allowed)\n ex: \"Chrome\" ",
+                "Title of the window to record (partial match).\n ex: \"Chrome\" ",
                 "Window Title", "");
             title = (title ?? string.Empty).Trim();
             if (string.IsNullOrEmpty(title)) return;
 
-            _targetWindow = FindWindowByTitleContains(title);
+            _targetWindow = FindWindowByTitleContains(title, _ownWindow);
+            _targetTitle = title;
             if (_targetWindow == IntPtr.Zero)
             {
                 if (MessageBox.Show("Could not find the window. Would you like to record in absolute screen coordinates?",
                     "Window not found", MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.No)
                     return;
+                _targetTitle = "";
             }
             StartRecording();
+        }
+
+        // 파일에서 읽은 매크로는 대상 창 핸들이 없다. 제목을 기억해 두고 재생할 때 다시 찾는다.
+        private void SetTarget(string title)
+        {
+            _targetTitle = title;
+            _targetWindow = string.IsNullOrWhiteSpace(title) ? IntPtr.Zero : FindWindowByTitleContains(title, _ownWindow);
         }
 
         private void BtnStopRecord_Click(object sender, RoutedEventArgs e) => StopRecording();
@@ -196,52 +190,42 @@ namespace MouseMacroWpf
         private async void BtnSave_Click(object sender, RoutedEventArgs e)
         {
             var dlg = new Microsoft.Win32.SaveFileDialog { Filter = "JSON files (*.json)|*.json", DefaultExt = ".json" };
-            if (dlg.ShowDialog() == true)
+            if (dlg.ShowDialog() != true) return;
+
+            foreach (var ev in _events) if (ev.DelayMs < 0) ev.DelayMs = 0;
+            try
             {
-                foreach (var ev in _events) if (ev.DelayMs <= 0) ev.DelayMs = 1000;
-
-                string json;
-                if (_calib != null && _calib.IsValid)
-                    json = JsonSerializer.Serialize(new MacroFile { Calibration = _calib, Events = _events },
-                                                    new JsonSerializerOptions { WriteIndented = true });
-                else
-                    json = JsonSerializer.Serialize(_events, new JsonSerializerOptions { WriteIndented = true });
-
-                await File.WriteAllTextAsync(dlg.FileName, json);
-                UI(() => TxtStatus.Text = $"Saved: {dlg.FileName}");
+                await File.WriteAllTextAsync(dlg.FileName, MacroSerializer.Serialize(_events, _calib, _targetTitle));
+                SetStatus($"Saved: {dlg.FileName}");
             }
+            catch (Exception ex) { MessageBox.Show("JSON Save Fail: " + ex.Message); }
         }
 
         private void BtnLoad_Click(object sender, RoutedEventArgs e)
         {
             var dlg = new Microsoft.Win32.OpenFileDialog { Filter = "JSON files (*.json)|*.json", DefaultExt = ".json" };
-            if (dlg.ShowDialog() == true)
+            if (dlg.ShowDialog() == true) LoadMacroFile(dlg.FileName);
+        }
+
+        private void LoadMacroFile(string path)
+        {
+            try
             {
-                try
-                {
-                    var text = File.ReadAllText(dlg.FileName).Trim();
-                    if (text.StartsWith("{"))
-                    {
-                        var mf = JsonSerializer.Deserialize<MacroFile>(text) ?? new MacroFile();
-                        _events = mf.Events ?? new();
-                        _calib = mf.Calibration ?? new();
-                    }
-                    else
-                    {
-                        _events = JsonSerializer.Deserialize<List<InputEvent>>(text) ?? new();
-                        // _calib 유지
-                    }
-                    UpdateCalibLabels();
-                    RefreshListAndJson();
-                    UI(() => TxtStatus.Text = $"Loaded: {dlg.FileName}");
-                }
-                catch (Exception ex) { UI(() => MessageBox.Show("JSON Load Fail: " + ex.Message)); }
+                var (events, calib, title) = MacroSerializer.Parse(File.ReadAllText(path));
+                _events = events;
+                if (calib != null) _calib = calib; // 배열 형식이면 캘리브는 유지
+                if (title != null) SetTarget(title);
+                UpdateCalibLabels();
+                RefreshListAndJson();
+                UpdateUiState();
+                SetStatus($"Loaded: {Path.GetFileName(path)}");
             }
+            catch (Exception ex) { MessageBox.Show("JSON Load Fail: " + ex.Message); }
         }
 
         private void BtnPlay_Click(object sender, RoutedEventArgs e)
         {
-            if (_events.Count == 0) { UI(() => MessageBox.Show("Please record first or load JSON.")); return; }
+            if (_events.Count == 0) { MessageBox.Show("Please record first or load JSON."); return; }
             StartPlayback();
         }
 
@@ -273,9 +257,8 @@ namespace MouseMacroWpf
             _calibPtTL = null;
             _calibPtBR = null;
             LblCalibHint.Text = "Calibration: Click CONTENT Top-Left, then Bottom-Right (2 clicks).";
-            UI(() => TxtStatus.Text = "Calibration waiting for 2 clicks...");
-            // 마우스 훅이 이미 설치되지 않았다면 잠시 설치해서 2클릭만 수집하는 방식도 가능하지만,
-            // 여기선 사용자가 Record 전/후 어느때나 할 수 있도록 항상 MouseHook에 처리 로직을 둡니다.
+            SetStatus("Calibration waiting for 2 clicks...");
+            // 녹화 전후 어느 때나 보정할 수 있게 마우스 훅만 잠시 건다. 두 번 누르면 다시 푼다.
             if (_mouseHookId == IntPtr.Zero) _mouseHookId = NativeMethods.SetMouseHook(_mouseProc);
         }
 
@@ -283,154 +266,154 @@ namespace MouseMacroWpf
         {
             _calib = new Calibration();
             UpdateCalibLabels();
-            UI(() => TxtStatus.Text = "Calibration cleared.");
+            SetStatus("Calibration cleared.");
         }
 
-        private void FinalizeCalibrationFromPoints(POINT tl, POINT br)
+        private void FinalizeCalibration(CorePoint tl, CorePoint br)
         {
-            // tl/br 은 "클라이언트 기준" 좌표
-            int x1 = Math.Min(tl.x, br.x);
-            int y1 = Math.Min(tl.y, br.y);
-            int x2 = Math.Max(tl.x, br.x);
-            int y2 = Math.Max(tl.y, br.y);
-
-            _calib = new Calibration
-            {
-                OffsetX = x1,
-                OffsetY = y1,
-                ContentW = Math.Max(1, x2 - x1),
-                ContentH = Math.Max(1, y2 - y1)
-            };
+            _calib = CoordinateMapper.FromCorners(tl, br);
             _calibActive = false;
+            // 녹화 중이 아니면 보정용으로 건 훅을 푼다. 남겨 두면 이후의 모든 클릭이 이벤트로 쌓인다.
+            if (!_recording) UnhookMouse();
             UpdateCalibLabels();
-            UI(() => TxtStatus.Text = "Calibration saved.");
+            SetStatus("Calibration saved.");
         }
 
         // ===== Recording (mouse + keyboard) ==================================
         private void StartRecording()
         {
             _events.Clear();
+            _clock = new RecordingClock();
+            _recording = true;
 
             if (_mouseHookId == IntPtr.Zero) _mouseHookId = NativeMethods.SetMouseHook(_mouseProc);
             if (_kbdHookId == IntPtr.Zero) _kbdHookId = NativeMethods.SetKeyboardHook(_kbdProc);
+            _refreshTimer.Start();
 
             BtnRecord.IsEnabled = false;
             BtnStopRecord.IsEnabled = true;
             BtnSave.IsEnabled = false;
             BtnLoad.IsEnabled = false;
             BtnPlay.IsEnabled = false;
-            UI(() => TxtStatus.Text = "Recording... (ESC: stop)");
-
-            var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
-            timer.Tick += (s, ev) =>
-            {
-                if (Keyboard.IsKeyDown(Key.Escape))
-                {
-                    timer.Stop();
-                    StopRecording();
-                }
-            };
-            timer.Start();
+            SetStatus("Recording... (ESC: stop)");
         }
 
         private void StopRecording()
         {
-            if (_mouseHookId != IntPtr.Zero) { NativeMethods.UnhookWindowsHookEx(_mouseHookId); _mouseHookId = IntPtr.Zero; }
-            if (_kbdHookId != IntPtr.Zero) { NativeMethods.UnhookWindowsHookEx(_kbdHookId); _kbdHookId = IntPtr.Zero; }
+            if (!_recording) return;
+            _recording = false;
+            _refreshTimer.Stop();
+            if (!_calibActive) UnhookMouse();
+            UnhookKeyboard();
 
-            foreach (var ev in _events) if (ev.DelayMs <= 0) ev.DelayMs = 1000;
-
+            _listDirty = false;
             RefreshListAndJson();
             BtnRecord.IsEnabled = true;
             BtnStopRecord.IsEnabled = false;
             BtnSave.IsEnabled = _events.Count > 0;
             BtnLoad.IsEnabled = true;
             BtnPlay.IsEnabled = _events.Count > 0;
-            UI(() => TxtStatus.Text = $"Recording stopped. {_events.Count} events.");
+            SetStatus($"Recording stopped. {_events.Count} events.");
+        }
+
+        private void UnhookMouse()
+        {
+            if (_mouseHookId != IntPtr.Zero) { NativeMethods.UnhookWindowsHookEx(_mouseHookId); _mouseHookId = IntPtr.Zero; }
+        }
+
+        private void UnhookKeyboard()
+        {
+            if (_kbdHookId != IntPtr.Zero) { NativeMethods.UnhookWindowsHookEx(_kbdHookId); _kbdHookId = IntPtr.Zero; }
+        }
+
+        private bool IsOwnWindowAt(int sx, int sy)
+        {
+            var hit = NativeMethods.WindowFromPoint(new POINT { x = sx, y = sy });
+            return hit != IntPtr.Zero && NativeMethods.GetAncestor(hit, NativeMethods.GA_ROOT) == _ownWindow;
         }
 
         private IntPtr MouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
         {
-            try
+            const int WM_LBUTTONDOWN = 0x0201;
+            if (nCode >= 0 && wParam.ToInt32() == WM_LBUTTONDOWN)
             {
-                if (nCode >= 0)
+                var info = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+                int sx = info.pt.x, sy = info.pt.y; // screen coords
+
+                // 이 도구 창(Stop Record 버튼 등)을 누른 것은 녹화하지 않는다. 재생 때 그 자리를 누르게 된다.
+                if (!IsOwnWindowAt(sx, sy))
                 {
-                    const int WM_LBUTTONDOWN = 0x0201;
-                    if (wParam.ToInt32() == WM_LBUTTONDOWN)
+                    // 대상 창 클라이언트로 변환
+                    var client = new CorePoint(sx, sy);
+                    if (_targetWindow != IntPtr.Zero)
                     {
-                        var info = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
-                        int sx = info.pt.x, sy = info.pt.y; // screen coords
+                        var pt = new POINT { x = sx, y = sy };
+                        if (NativeMethods.ScreenToClient(_targetWindow, ref pt)) client = new CorePoint(pt.x, pt.y);
+                    }
 
-                        // 대상 창 클라이언트로 변환
-                        int cx = sx, cy = sy;
-                        if (_targetWindow != IntPtr.Zero)
-                        {
-                            var pt = new POINT { x = sx, y = sy };
-                            if (NativeMethods.ScreenToClient(_targetWindow, ref pt)) { cx = pt.x; cy = pt.y; }
-                        }
-
+                    if (_calibActive)
+                    {
                         // 캘리브레이션 수집 모드일 때: 두 점만 수집
-                        if (_calibActive)
+                        if (_calibPtTL is null) { _calibPtTL = client; SetStatus("Calibration: click Bottom-Right."); }
+                        else if (_calibPtBR is null)
                         {
-                            if (_calibPtTL is null) _calibPtTL = new POINT { x = cx, y = cy };
-                            else if (_calibPtBR is null) _calibPtBR = new POINT { x = cx, y = cy };
-
-                            if (_calibPtTL is not null && _calibPtBR is not null)
-                                UI(() => FinalizeCalibrationFromPoints(_calibPtTL.Value, _calibPtBR.Value));
-                            else
-                                UI(() => TxtStatus.Text = "Calibration: click Bottom-Right.");
-                            return NativeMethods.CallNextHookEx(_mouseHookId, nCode, wParam, lParam);
+                            _calibPtBR = client;
+                            var tl = _calibPtTL.Value; var br = _calibPtBR.Value;
+                            Dispatcher.BeginInvoke(() => FinalizeCalibration(tl, br));
                         }
-
-                        // 일반 녹화: 좌표 저장 (캘리브 유효 시 컨텐츠 좌표로 정규화)
-                        if (_calib.IsValid)
+                    }
+                    else if (_recording)
+                    {
+                        // 일반 녹화: 캘리브 유효 시 컨텐츠 좌표로 정규화
+                        var stored = CoordinateMapper.ToStored(client, _calib);
+                        _events.Add(new InputEvent
                         {
-                            cx -= _calib.OffsetX;
-                            cy -= _calib.OffsetY;
-                        }
-
-                        _events.Add(new InputEvent { Type = EventType.MouseClick, X = cx, Y = cy, Button = 0, DelayMs = 1000 });
-                        UI(RefreshListAndJson);
+                            Type = EventType.MouseClick, X = stored.X, Y = stored.Y, Button = 0,
+                            DelayMs = _clock.Next(info.time)
+                        });
+                        _listDirty = true;
                     }
                 }
             }
-            catch { /* ignore */ }
-
             return NativeMethods.CallNextHookEx(_mouseHookId, nCode, wParam, lParam);
         }
 
         private IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
         {
-            try
+            const int WM_KEYDOWN = 0x0100, WM_KEYUP = 0x0101, WM_SYSKEYDOWN = 0x0104, WM_SYSKEYUP = 0x0105;
+            const uint LLKHF_EXTENDED = 0x01;
+            const int VK_ESCAPE = 0x1B;
+            int msg = wParam.ToInt32();
+            if (nCode >= 0 && _recording && (msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP))
             {
-                if (nCode >= 0)
+                var info = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
+                int vk = (int)info.vkCode;
+                bool down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+
+                // ESC 는 녹화를 끝내는 키다. 이벤트로 남기면 재생할 때 대상 창에 ESC 가 들어간다.
+                if (vk == VK_ESCAPE)
                 {
-                    const int WM_KEYDOWN = 0x0100, WM_KEYUP = 0x0101;
-                    int msg = wParam.ToInt32();
-                    if (msg == WM_KEYDOWN || msg == WM_KEYUP)
+                    if (down) Dispatcher.BeginInvoke(StopRecording);
+                    return NativeMethods.CallNextHookEx(_kbdHookId, nCode, wParam, lParam);
+                }
+
+                // 정지 핫키(Ctrl+Alt+X)는 녹화 제외
+                bool isCtrl = Keyboard.IsKeyDown(Key.LeftCtrl) || Keyboard.IsKeyDown(Key.RightCtrl);
+                bool isAlt = Keyboard.IsKeyDown(Key.LeftAlt) || Keyboard.IsKeyDown(Key.RightAlt);
+                bool isX = vk == KeyInterop.VirtualKeyFromKey(Key.X);
+                if (!(isCtrl && isAlt && isX))
+                {
+                    _events.Add(new InputEvent
                     {
-                        var info = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
-                        int vk = (int)info.vkCode;
-
-                        // 정지 핫키(Ctrl+Alt+X)는 녹화 제외
-                        bool isCtrl = Keyboard.IsKeyDown(Key.LeftCtrl) || Keyboard.IsKeyDown(Key.RightCtrl);
-                        bool isAlt = Keyboard.IsKeyDown(Key.LeftAlt) || Keyboard.IsKeyDown(Key.RightAlt);
-                        bool isX = vk == KeyInterop.VirtualKeyFromKey(Key.X);
-                        if (isCtrl && isAlt && isX) return NativeMethods.CallNextHookEx(_kbdHookId, nCode, wParam, lParam);
-
-                        _events.Add(new InputEvent
-                        {
-                            Type = (msg == WM_KEYDOWN) ? EventType.KeyDown : EventType.KeyUp,
-                            VkCode = vk,
-                            ScanCode = (int)info.scanCode,
-                            DelayMs = 1000
-                        });
-                        UI(RefreshListAndJson);
-                    }
+                        Type = down ? EventType.KeyDown : EventType.KeyUp,
+                        VkCode = vk,
+                        ScanCode = (int)info.scanCode,
+                        Extended = (info.flags & LLKHF_EXTENDED) != 0,
+                        DelayMs = _clock.Next(info.time)
+                    });
+                    _listDirty = true;
                 }
             }
-            catch { /* ignore */ }
-
             return NativeMethods.CallNextHookEx(_kbdHookId, nCode, wParam, lParam);
         }
 
@@ -438,7 +421,7 @@ namespace MouseMacroWpf
         private void StartPlayback()
         {
             // JSON 편집 반영
-            TryLoadEventsFromJsonText();
+            if (!TryLoadEventsFromJsonText()) return;
 
             // 재생 중 캘리브 수집 금지
             _calibActive = false;
@@ -451,49 +434,61 @@ namespace MouseMacroWpf
             BtnSave.IsEnabled = false;
             TxtStatus.Text = "Playing...";
 
-            // 🔒 재생 중 편집 잠금 (열거 수정 방지)
+            // 재생 중 편집 잠금 (열거 수정 방지)
             ListEvents.IsEnabled = false;
             TxtJson.IsReadOnly = true;
 
             _playbackCts = new CancellationTokenSource();
             var token = _playbackCts.Token;
 
-            // ✔️ 이벤트 스냅샷 (복사본)
-            var snapshot = _events.ToArray(); // <- 핵심
-
-            // UI 스냅샷
-            bool useAdb = false; int devW = 0, devH = 0;
-            useAdb = (ChkUseAdb.IsChecked == true);
-            if (useAdb) { int.TryParse(TxtDevW.Text, out devW); int.TryParse(TxtDevH.Text, out devH); }
+            // 이벤트·설정 스냅샷. 재생 스레드는 이 복사본만 본다.
+            var snapshot = _events.ToArray();
+            var calib = _calib;
+            // 창을 닫았다 다시 열었으면 핸들이 바뀐다. 제목으로 다시 찾는다.
+            if (_targetTitle.Length > 0 && !NativeMethods.IsWindow(_targetWindow))
+                _targetWindow = FindWindowByTitleContains(_targetTitle, _ownWindow);
+            if (_targetTitle.Length > 0 && _targetWindow == IntPtr.Zero)
+            {
+                MessageBox.Show($"No window whose title contains \"{_targetTitle}\" is open. Open it and press Play again.");
+                StopPlaybackUiCleanup();
+                TxtStatus.Text = "Idle";
+                return;
+            }
+            var target = _targetWindow;
+            bool useAdb = ChkUseAdb.IsChecked == true;
+            int devW = 0, devH = 0;
+            if (useAdb && (!int.TryParse(TxtDevW.Text, out devW) || !int.TryParse(TxtDevH.Text, out devH) || devW <= 0 || devH <= 0))
+            {
+                MessageBox.Show("Device W and H must be positive numbers for ADB playback.");
+                StopPlaybackUiCleanup();
+                TxtStatus.Text = "Idle";
+                return;
+            }
 
             RegisterStopHotkey();
 
             _ = Task.Run(async () =>
             {
+                string end = "Playback finished.";
                 try
                 {
-                    // ⬇️ 복사본만 전달
-                    await PlaybackLoop(snapshot, token, useAdb, devW, devH);
+                    await PlaybackLoop(snapshot, calib, target, token, useAdb, devW, devH);
                 }
-                catch (OperationCanceledException) { }
-                catch (Exception ex) { UI(() => MessageBox.Show("Playback error: " + ex.Message)); }
+                catch (OperationCanceledException) { end = "Playback stopped by user."; }
+                catch (Exception ex) { end = "Playback error: " + ex.Message; UI(() => MessageBox.Show(end)); }
                 finally
                 {
-                    UI(() => UnregisterStopHotkey());
-                    UI(StopPlaybackUiCleanup);
-                    UI(() => TxtStatus.Text = "Playback stopped.");
+                    UI(() =>
+                    {
+                        UnregisterStopHotkey();
+                        StopPlaybackUiCleanup();
+                        TxtStatus.Text = end;
+                    });
                 }
             });
         }
 
-
-        private void StopPlayback()
-        {
-            _playbackCts?.Cancel();
-            UI(() => UnregisterStopHotkey());
-            UI(StopPlaybackUiCleanup);
-            UI(() => TxtStatus.Text = "Playback stopped by user.");
-        }
+        private void StopPlayback() => _playbackCts?.Cancel();
 
         private void StopPlaybackUiCleanup()
         {
@@ -503,65 +498,48 @@ namespace MouseMacroWpf
             BtnLoad.IsEnabled = true;
             BtnSave.IsEnabled = _events.Count > 0;
 
-            // 🔓 재생 종료 후 편집 가능
+            // 재생 종료 후 편집 가능
             ListEvents.IsEnabled = true;
             TxtJson.IsReadOnly = false;
         }
 
-
-        private async Task PlaybackLoop(IReadOnlyList<InputEvent> events, CancellationToken token, bool useAdb, int devW, int devH)
+        private async Task PlaybackLoop(IReadOnlyList<InputEvent> events, Calibration calib, IntPtr target,
+            CancellationToken token, bool useAdb, int devW, int devH)
         {
-            // 창 위치/크기
-            int winLeft = 0, winTop = 0, clientW = 0, clientH = 0;
-            if (_targetWindow != IntPtr.Zero)
-            {
-                if (NativeMethods.GetWindowRect(_targetWindow, out RECT wr))
-                { winLeft = wr.Left; winTop = wr.Top; }
-                if (NativeMethods.GetClientRect(_targetWindow, out RECT rc))
-                { clientW = rc.Right - rc.Left; clientH = rc.Bottom - rc.Top; }
-            }
-
             foreach (var ev in events)
             {
                 token.ThrowIfCancellationRequested();
-                await Task.Delay(ev.DelayMs, token);
+                if (ev.DelayMs > 0) await Task.Delay(ev.DelayMs, token);
 
                 switch (ev.Type)
                 {
                     case EventType.MouseClick:
+                        var stored = new CorePoint(ev.X, ev.Y);
                         if (useAdb)
                         {
                             // ADB: 캘리브가 있으면 컨텐츠 기준, 없으면 클라이언트 기준
-                            int baseW = _calib.IsValid ? _calib.ContentW : clientW;
-                            int baseH = _calib.IsValid ? _calib.ContentH : clientH;
-                            if (baseW <= 0 || baseH <= 0) { UI(() => MessageBox.Show("Invalid window/calibre size for ADB mapping.")); return; }
-
-                            int cx = ev.X, cy = ev.Y;
-                            if (!_calib.IsValid)
-                            {
-                                // 클라이언트 좌표로 녹화되었다고 가정
-                                // (화면절대좌표로 녹화된 경우엔 ADB가 맞지 않을 수 있음)
-                            }
-
-                            int dx = (int)Math.Round((double)cx / baseW * devW);
-                            int dy = (int)Math.Round((double)cy / baseH * devH);
-                            RunAdb($"shell input tap {dx} {dy}");
+                            int clientW = 0, clientH = 0;
+                            if (target != IntPtr.Zero && NativeMethods.GetClientRect(target, out RECT rc))
+                            { clientW = rc.Right - rc.Left; clientH = rc.Bottom - rc.Top; }
+                            var dev = CoordinateMapper.ToDevice(stored, calib, clientW, clientH, devW, devH)
+                                ?? throw new InvalidOperationException("Invalid window/calibration size for ADB mapping.");
+                            RunAdb($"shell input tap {dev.X} {dev.Y}");
                         }
                         else
                         {
-                            // PC: 컨텐츠 → 스크린
-                            int sx, sy;
-                            if (_calib.IsValid)
+                            // 클라이언트 원점(ClientToScreen)으로 화면 좌표를 만든다. 창 사각형(GetWindowRect)은
+                            // 제목 표시줄과 테두리를 포함해서, 그 기준으로 더하면 클릭이 아래·오른쪽으로 밀린다.
+                            // 매 이벤트마다 다시 읽으니 재생 중에 창을 옮겨도 따라간다.
+                            var screen = stored;
+                            if (target != IntPtr.Zero)
                             {
-                                sx = winLeft + _calib.OffsetX + ev.X;
-                                sy = winTop + _calib.OffsetY + ev.Y;
+                                if (!NativeMethods.IsWindow(target))
+                                    throw new InvalidOperationException("The target window was closed.");
+                                var o = new POINT { x = 0, y = 0 };
+                                NativeMethods.ClientToScreen(target, ref o);
+                                screen = CoordinateMapper.ToScreen(stored, calib, new CorePoint(o.x, o.y));
                             }
-                            else
-                            {
-                                sx = winLeft + ev.X;
-                                sy = winTop + ev.Y;
-                            }
-                            ClickAbsVirtual(sx, sy);
+                            ClickAbsVirtual(screen.X, screen.Y);
                         }
                         break;
 
@@ -569,13 +547,13 @@ namespace MouseMacroWpf
                     case EventType.KeyUp:
                         if (useAdb)
                         {
-                            if (AdbKeyEventForVk(ev.VkCode) is int androidKey)
+                            // ADB 는 누름·뗌을 따로 보내지 않는다. 누를 때 한 번만 보낸다.
+                            if (ev.Type == EventType.KeyDown && AdbKeyMap.FromVk(ev.VkCode) is int androidKey)
                                 RunAdb($"shell input keyevent {androidKey}");
                         }
                         else
                         {
-                            bool down = ev.Type == EventType.KeyDown;
-                            SendKey(down, ev.VkCode, ev.ScanCode);
+                            SendKey(ev.Type == EventType.KeyDown, ev.VkCode, ev.ScanCode, ev.Extended);
                         }
                         break;
                 }
@@ -583,7 +561,7 @@ namespace MouseMacroWpf
         }
 
         // ===== Low-level: Mouse/Keyboard send =================================
-        private void ClickAbsVirtual(int screenX, int screenY)
+        private static void ClickAbsVirtual(int screenX, int screenY)
         {
             const int SM_XVIRTUALSCREEN = 76, SM_YVIRTUALSCREEN = 77, SM_CXVIRTUALSCREEN = 78, SM_CYVIRTUALSCREEN = 79;
             int vx = NativeMethods.GetSystemMetrics(SM_XVIRTUALSCREEN);
@@ -603,14 +581,15 @@ namespace MouseMacroWpf
             NativeMethods.SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>());
         }
 
-        private void SendKey(bool down, int vk, int scan = 0)
+        private static void SendKey(bool down, int vk, int scan, bool extended)
         {
             const uint INPUT_KEYBOARD = 1;
-            const uint KEYEVENTF_KEYUP = 0x0002, KEYEVENTF_SCANCODE = 0x0008;
+            const uint KEYEVENTF_EXTENDEDKEY = 0x0001, KEYEVENTF_KEYUP = 0x0002, KEYEVENTF_SCANCODE = 0x0008;
 
             uint flags = 0;
             if (!down) flags |= KEYEVENTF_KEYUP;
             if (scan > 0) flags |= KEYEVENTF_SCANCODE;
+            if (extended) flags |= KEYEVENTF_EXTENDEDKEY;
 
             var inp = new INPUT
             {
@@ -628,53 +607,41 @@ namespace MouseMacroWpf
             NativeMethods.SendInput(1, new[] { inp }, Marshal.SizeOf<INPUT>());
         }
 
-        private int? AdbKeyEventForVk(int vk) => vk switch
+        private static void RunAdb(string args)
         {
-            0x0D => 66,   // Enter -> KEYCODE_ENTER
-            0x1B => 111,  // Esc   -> KEYCODE_ESCAPE
-            0x08 => 67,   // Backspace -> KEYCODE_DEL
-            0x09 => 61,   // Tab -> KEYCODE_TAB
-            _ => null
-        };
-
-        private void RunAdb(string args)
-        {
-            try
+            using var p = new Process();
+            p.StartInfo = new ProcessStartInfo("adb", args)
             {
-                var p = new Process();
-                p.StartInfo = new ProcessStartInfo("adb", args)
-                {
-                    CreateNoWindow = true,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true
-                };
-                p.Start(); _ = p.StandardOutput.ReadToEnd(); p.WaitForExit(3000);
-            }
-            catch (Exception ex) { UI(() => MessageBox.Show("adb execution error: " + ex.Message)); }
+                CreateNoWindow = true,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            try { p.Start(); }
+            catch (Exception ex) { throw new InvalidOperationException("adb could not start. Is adb on PATH? " + ex.Message, ex); }
+            var stdout = p.StandardOutput.ReadToEndAsync();
+            var stderr = p.StandardError.ReadToEndAsync();
+            if (!p.WaitForExit(3000)) throw new InvalidOperationException("adb did not finish in 3 seconds: " + args);
+            if (p.ExitCode != 0) throw new InvalidOperationException($"adb {args} failed: {stderr.Result.Trim()}");
+            _ = stdout.Result;
         }
 
         // ===== Hotkey (Ctrl+Alt+X) ===========================================
         private void RegisterStopHotkey()
         {
             if (_hotkeyRegistered) return;
-            var helper = new System.Windows.Interop.WindowInteropHelper(this);
-            var hWnd = helper.Handle;
-            var src = System.Windows.Interop.HwndSource.FromHwnd(hWnd);
-            src.AddHook(HwndHook);
-
             const uint MOD_CONTROL = 0x0002, MOD_ALT = 0x0001;
             uint vk = (uint)KeyInterop.VirtualKeyFromKey(Key.X);
 
-            if (!NativeMethods.RegisterHotKey(hWnd, HOTKEY_ID, MOD_CONTROL | MOD_ALT, vk))
-                UI(() => MessageBox.Show("Hotkey registration failed (Ctrl+Alt+X)"));
+            if (!NativeMethods.RegisterHotKey(_ownWindow, HOTKEY_ID, MOD_CONTROL | MOD_ALT, vk))
+                MessageBox.Show("Hotkey registration failed (Ctrl+Alt+X). Another app may be using it; use the Stop button.");
             else _hotkeyRegistered = true;
         }
 
         private void UnregisterStopHotkey()
         {
             if (!_hotkeyRegistered) return;
-            var helper = new System.Windows.Interop.WindowInteropHelper(this);
-            NativeMethods.UnregisterHotKey(helper.Handle, HOTKEY_ID);
+            NativeMethods.UnregisterHotKey(_ownWindow, HOTKEY_ID);
             _hotkeyRegistered = false;
         }
 
@@ -686,12 +653,12 @@ namespace MouseMacroWpf
         }
 
         // ===== Window search by partial title =================================
-        private static IntPtr FindWindowByTitleContains(string text)
+        private static IntPtr FindWindowByTitleContains(string text, IntPtr exclude)
         {
             IntPtr found = IntPtr.Zero;
             NativeMethods.EnumWindows((hWnd, lParam) =>
             {
-                if (!NativeMethods.IsWindowVisible(hWnd)) return true;
+                if (hWnd == exclude || !NativeMethods.IsWindowVisible(hWnd)) return true;
                 StringBuilder sb = new(512);
                 NativeMethods.GetWindowText(hWnd, sb, sb.Capacity);
                 if (sb.ToString().Contains(text, StringComparison.OrdinalIgnoreCase)) { found = hWnd; return false; }
@@ -705,8 +672,8 @@ namespace MouseMacroWpf
         private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
 
         [StructLayout(LayoutKind.Sequential)] private struct POINT { public int x, y; }
-        [StructLayout(LayoutKind.Sequential)] private struct MSLLHOOKSTRUCT { public POINT pt; public uint mouseData, flags, time, dwExtraInfo; }
-        [StructLayout(LayoutKind.Sequential)] private struct KBDLLHOOKSTRUCT { public uint vkCode, scanCode, flags, time, dwExtraInfo; }
+        [StructLayout(LayoutKind.Sequential)] private struct MSLLHOOKSTRUCT { public POINT pt; public uint mouseData, flags, time; public IntPtr dwExtraInfo; }
+        [StructLayout(LayoutKind.Sequential)] private struct KBDLLHOOKSTRUCT { public uint vkCode, scanCode, flags, time; public IntPtr dwExtraInfo; }
         [StructLayout(LayoutKind.Sequential)] private struct RECT { public int Left, Top, Right, Bottom; }
 
         [StructLayout(LayoutKind.Sequential)] private struct INPUT { public uint type; public InputUnion U; }
@@ -725,6 +692,7 @@ namespace MouseMacroWpf
         private static class NativeMethods
         {
             public const int WH_MOUSE_LL = 14, WH_KEYBOARD_LL = 13;
+            public const uint GA_ROOT = 2;
 
             [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
             public static extern IntPtr SetWindowsHookEx(int idHook, LowLevelMouseProc lpfn, IntPtr hMod, uint dwThreadId);
@@ -745,8 +713,11 @@ namespace MouseMacroWpf
             public static IntPtr SetKeyboardHook(LowLevelKeyboardProc proc) => SetWindowsHookEx(WH_KEYBOARD_LL, proc, GetModuleHandle(null), 0);
 
             [DllImport("user32.dll")] public static extern bool ScreenToClient(IntPtr hWnd, ref POINT lpPoint);
-            [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+            [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr hWnd, ref POINT lpPoint);
             [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr hWnd, out RECT rect);
+            [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
+            [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT point);
+            [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hWnd, uint flags);
             [DllImport("user32.dll")] public static extern int GetSystemMetrics(int nIndex);
 
             [DllImport("user32.dll", SetLastError = true)]

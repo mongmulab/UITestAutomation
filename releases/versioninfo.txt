@@ -1,2 +1,0 @@
-MouseMacroWpf v1.0.0
-- Initial open source release with calibration & keyboard support

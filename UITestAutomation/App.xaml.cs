@@ -1,18 +1,10 @@
-﻿using System;
-using System.Runtime.InteropServices;
-using System.Windows;
+﻿using System.Windows;
 
-namespace MouseMacroWpf
+namespace UITestAutomation
 {
+    // DPI awareness (Per-Monitor V2) is declared in app.manifest.
+    // Setting it from code after WPF has started is too late and silently fails.
     public partial class App : Application
     {
-        [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr value);
-        static readonly IntPtr PMv2 = new IntPtr(-4); // PER_MONITOR_AWARE_V2
-
-        protected override void OnStartup(StartupEventArgs e)
-        {
-            try { SetProcessDpiAwarenessContext(PMv2); } catch { /* ignore */ }
-            base.OnStartup(e);
-        }
     }
 }

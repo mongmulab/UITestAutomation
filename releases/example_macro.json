@@ -1,26 +1,12 @@
 {
-  "Calibration": {
-    "OffsetX": 80,
-    "OffsetY": 120,
-    "ContentW": 1000,
-    "ContentH": 600
-  },
+  "TargetTitle": "Notepad",
   "Events": [
-    {
-      "Type": "MouseClick",
-      "X": 300,
-      "Y": 200,
-      "DelayMs": 800
-    },
-    {
-      "Type": "KeyDown",
-      "VkCode": 13,
-      "DelayMs": 200
-    },
-    {
-      "Type": "KeyUp",
-      "VkCode": 13,
-      "DelayMs": 200
-    }
+    { "Type": "MouseClick", "X": 300, "Y": 200, "DelayMs": 1000 },
+    { "Type": "KeyDown", "VkCode": 72, "ScanCode": 35, "DelayMs": 400 },
+    { "Type": "KeyUp", "VkCode": 72, "ScanCode": 35, "DelayMs": 90 },
+    { "Type": "KeyDown", "VkCode": 73, "ScanCode": 23, "DelayMs": 120 },
+    { "Type": "KeyUp", "VkCode": 73, "ScanCode": 23, "DelayMs": 80 },
+    { "Type": "KeyDown", "VkCode": 37, "ScanCode": 75, "Extended": true, "DelayMs": 300 },
+    { "Type": "KeyUp", "VkCode": 37, "ScanCode": 75, "Extended": true, "DelayMs": 80 }
   ]
 }

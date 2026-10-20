@@ -1,0 +1,8 @@
+{
+  "TargetTitle": "UTA Target Window",
+  "Events": [
+    { "Type": "MouseClick", "X": 50, "Y": 40, "DelayMs": 1500 },
+    { "Type": "MouseClick", "X": 400, "Y": 300, "DelayMs": 500 },
+    { "Type": "MouseClick", "X": 620, "Y": 10, "DelayMs": 500 }
+  ]
+}
