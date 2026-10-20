@@ -22,7 +22,7 @@ It does not look at the screen, so if the target app shows something different, 
 
 ## Download
 
-Get `UITestAutomation_vX.Y.Z.zip` from [Releases](https://github.com/loganMongmu/UITestAutomation/releases).
+Get `UITestAutomation_vX.Y.Z.zip` from [Releases](https://github.com/mongmulab/UITestAutomation/releases).
 It is a single self-contained `.exe` for Windows 10/11 x64, so nothing else needs to be installed.
 Each release lists the SHA256 of the zip.
 
