@@ -109,11 +109,17 @@ namespace UITestAutomation
             else
             {
                 LblOffX.Text = LblOffY.Text = LblCW.Text = LblCH.Text = "-";
-                LblCalibHint.Text = "Click Start, then click the top-left and bottom-right corners of the phone screen.";
+                LblCalibHint.Text = "Click Start, then the top-left and bottom-right corners of the phone screen.";
             }
         }
 
         private sealed record EventRow(int No, string Kind, string Detail, string Delay);
+
+        private static string KeyName(int vk)
+        {
+            var key = KeyInterop.KeyFromVirtualKey(vk);
+            return key == Key.None ? "?" : key.ToString();
+        }
 
         private void RefreshListAndJson()
         {
@@ -121,12 +127,12 @@ namespace UITestAutomation
             for (int i = 0; i < _events.Count; i++)
             {
                 var ev = _events[i];
-                string ext = ev.Extended ? "  ext" : "";
+                string ext = ev.Extended ? " (ext)" : "";
                 var row = ev.Type switch
                 {
                     EventType.MouseClick => new EventRow(i + 1, "CLICK", $"({ev.X}, {ev.Y})", $"{ev.DelayMs} ms"),
-                    EventType.KeyDown => new EventRow(i + 1, "KEY DOWN", $"VK {ev.VkCode}  scan {ev.ScanCode}{ext}", $"{ev.DelayMs} ms"),
-                    EventType.KeyUp => new EventRow(i + 1, "KEY UP", $"VK {ev.VkCode}  scan {ev.ScanCode}{ext}", $"{ev.DelayMs} ms"),
+                    EventType.KeyDown => new EventRow(i + 1, "KEY DOWN", $"{KeyName(ev.VkCode)}{ext}   VK {ev.VkCode}", $"{ev.DelayMs} ms"),
+                    EventType.KeyUp => new EventRow(i + 1, "KEY UP", $"{KeyName(ev.VkCode)}{ext}   VK {ev.VkCode}", $"{ev.DelayMs} ms"),
                     _ => new EventRow(i + 1, "?", "", "")
                 };
                 ListEvents.Items.Add(row);

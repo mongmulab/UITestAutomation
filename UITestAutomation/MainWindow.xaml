@@ -1,7 +1,7 @@
 ﻿<Window x:Class="UITestAutomation.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="UI Test Automation" Height="660" Width="1000" MinHeight="600" MinWidth="860"
+        Title="UI Test Automation" Height="720" Width="1000" MinHeight="660" MinWidth="860"
         Background="{StaticResource WindowBg}" FontFamily="Segoe UI" FontSize="13"
         Foreground="{StaticResource Text}" UseLayoutRounding="True">
     <DockPanel>
@@ -71,7 +71,7 @@
                                 <Button x:Name="BtnSave" Click="BtnSave_Click" IsEnabled="False">Save JSON</Button>
                             </UniformGrid>
                             <TextBlock Style="{StaticResource Hint}" Margin="0,4,0,0"
-                                       Text="Press ESC to stop recording. Clicks on this window are not recorded."/>
+                                       Text="ESC stops recording. Clicks on this window are not recorded."/>
                         </StackPanel>
                     </Border>
 
@@ -96,7 +96,7 @@
                                 <TextBox x:Name="TxtDevH" Grid.Column="3" Text="2400" IsEnabled="False"/>
                             </Grid>
 
-                            <Border Height="1" Background="{StaticResource Line}" Margin="0,14"/>
+                            <Border Height="1" Background="{StaticResource Line}" Margin="0,12"/>
 
                             <TextBlock FontWeight="SemiBold" Text="Calibration" Margin="0,0,0,8"/>
                             <UniformGrid Columns="2" Margin="0,0,-8,0">
@@ -123,7 +123,7 @@
                                 </StackPanel>
                             </UniformGrid>
                             <TextBlock x:Name="LblCalibHint" Style="{StaticResource Hint}" Margin="0,10,0,0"
-                                       Text="Click Start, then click the top-left and bottom-right corners of the phone screen."/>
+                                       Text="Click Start, then the top-left and bottom-right corners of the phone screen."/>
                         </StackPanel>
                     </Border>
                 </StackPanel>
@@ -155,7 +155,7 @@
                                  ScrollViewer.HorizontalScrollBarVisibility="Disabled">
                             <ListBox.ItemContainerStyle>
                                 <Style TargetType="ListBoxItem">
-                                    <Setter Property="Padding" Value="8,5"/>
+                                    <Setter Property="Padding" Value="8,3"/>
                                     <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
                                 </Style>
                             </ListBox.ItemContainerStyle>
